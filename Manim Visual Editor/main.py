@@ -3,7 +3,7 @@ import os
 import uuid
 import copy
 from dataclasses import dataclass
-from typing import Optional, List, Tuple, Dict, Any, Callable, Union
+from typing import Optional, List, Tuple, Dict, Any, Callable
 from decimal import Decimal
 from io import BytesIO
 from manim import Text, MathTex, config
@@ -38,21 +38,107 @@ plt.rcParams.update({
     "figure.dpi": 150,
 })
 
-QUALITY_MAP: Dict[str, str] = {
+QUALITY_MAP = {
     "480p (854*480)": "854,480",
     "720p (1280*720)": "1280,720",
     "1080p (1920*1080)": "1920,1080",
     "4K (3840*2160)": "3840,2160"
 }
-MANIM_COLORS_LIST: List[str] = [
-    "WHITE", "GRAY_A", "GREY_A", "GRAY_B", "GREY_B", "GRAY_C", "GREY_C", "GRAY_D", "GREY_D", "GRAY_E", "GREY_E", "BLACK",
-    "LIGHTER_GRAY", "LIGHTER_GREY", "LIGHT_GRAY", "LIGHT_GREY", "GRAY", "GREY", "DARK_GRAY", "DARK_GREY", "DARKER_GRAY", "DARKER_GREY",
-    "BLUE_A", "BLUE_B", "BLUE_C", "BLUE_D", "BLUE_E", "PURE_BLUE", "BLUE", "DARK_BLUE", "TEAL_A", "TEAL_B", "TEAL_C", "TEAL_D", "TEAL_E", "TEAL",
-    "GREEN_A", "GREEN_B", "GREEN_C", "GREEN_D", "GREEN_E", "PURE_GREEN", "GREEN","YELLOW_A", "YELLOW_B", "YELLOW_C", "YELLOW_D", "YELLOW_E", "YELLOW",
-    "GOLD_A", "GOLD_B", "GOLD_C", "GOLD_D", "GOLD_E", "GOLD","RED_A", "RED_B", "RED_C", "RED_D", "RED_E", "PURE_RED", "RED",
-    "MAROON_A", "MAROON_B", "MAROON_C", "MAROON_D", "MAROON_E", "MAROON","PURPLE_A", "PURPLE_B", "PURPLE_C", "PURPLE_D", "PURPLE_E", "PURPLE", "PINK", "LIGHT_PINK",
-    "ORANGE", "LIGHT_BROWN", "DARK_BROWN", "GRAY_BROWN", "GREY_BROWN", "LOGO_WHITE", "LOGO_GREEN", "LOGO_BLUE", "LOGO_RED", "LOGO_BLACK"
-]
+
+MANIM_COLORS_DICT = {
+    "WHITE": "#FFFFFF",
+    "GRAY_A": "#DDDDDD",
+    "GREY_A": "#DDDDDD",
+    "GRAY_B": "#BBBBBB",
+    "GREY_B": "#BBBBBB",
+    "GRAY_C": "#888888",
+    "GREY_C": "#888888",
+    "GRAY_D": "#444444",
+    "GREY_D": "#444444",
+    "GRAY_E": "#222222",
+    "GREY_E": "#222222",
+    "BLACK": "#000000",
+    "LIGHTER_GRAY": "#DDDDDD",
+    "LIGHTER_GREY": "#DDDDDD",
+    "LIGHT_GRAY": "#BBBBBB",
+    "LIGHT_GREY": "#BBBBBB",
+    "GRAY": "#888888",
+    "GREY": "#888888",
+    "DARK_GRAY": "#444444",
+    "DARK_GREY": "#444444",
+    "DARKER_GRAY": "#222222",
+    "DARKER_GREY": "#222222",
+    "BLUE_A": "#C7E9F1",
+    "BLUE_B": "#9CDCEB",
+    "BLUE_C": "#58C4DD",
+    "BLUE_D": "#29ABCA",
+    "BLUE_E": "#236B8E",
+    "PURE_BLUE": "#0000FF",
+    "BLUE": "#58C4DD",
+    "DARK_BLUE": "#236B8E",
+    "TEAL_A": "#ACEAD7",
+    "TEAL_B": "#76DDC0",
+    "TEAL_C": "#5CD0B3",
+    "TEAL_D": "#55C1A7",
+    "TEAL_E": "#49A88F",
+    "TEAL": "#5CD0B3",
+    "GREEN_A": "#C9E2AE",
+    "GREEN_B": "#A6CF8C",
+    "GREEN_C": "#83C167",
+    "GREEN_D": "#77B05D",
+    "GREEN_E": "#699C52",
+    "PURE_GREEN": "#00FF00",
+    "GREEN": "#83C167",
+    "YELLOW_A": "#FFF1B6",
+    "YELLOW_B": "#FFEA94",
+    "YELLOW_C": "#FFFF00",
+    "YELLOW_D": "#F4D345",
+    "YELLOW_E": "#E8C11C",
+    "YELLOW": "#FFFF00",
+    "GOLD_A": "#F7C797",
+    "GOLD_B": "#F9B775",
+    "GOLD_C": "#F0AC5F",
+    "GOLD_D": "#E1A158",
+    "GOLD_E": "#C78D46",
+    "GOLD": "#F0AC5F",
+    "RED_A": "#F7A1A3",
+    "RED_B": "#FF8080",
+    "RED_C": "#FC6255",
+    "RED_D": "#E65A4C",
+    "RED_E": "#CF5044",
+    "PURE_RED": "#FF0000",
+    "RED": "#FC6255",
+    "MAROON_A": "#ECABC1",
+    "MAROON_B": "#EC92AB",
+    "MAROON_C": "#C55F73",
+    "MAROON_D": "#A24D61",
+    "MAROON_E": "#94424F",
+    "MAROON": "#C55F73",
+    "PURPLE_A": "#CAA3E8",
+    "PURPLE_B": "#B189C6",
+    "PURPLE_C": "#9A72AC",
+    "PURPLE_D": "#715582",
+    "PURPLE_E": "#644172",
+    "PURPLE": "#9A72AC",
+    "PINK": "#D147BD",
+    "LIGHT_PINK": "#DC75CD",
+    "ORANGE": "#FF862F",
+    "LIGHT_BROWN": "#CD853F",
+    "DARK_BROWN": "#8B4513",
+    "GRAY_BROWN": "#736357",
+    "GREY_BROWN": "#736357",
+
+    # Colors used for Manim Community's logo and banner
+
+    "LOGO_WHITE": "#ECE7E2",
+    "LOGO_GREEN": "#87C2A5",
+    "LOGO_BLUE": "#525893",
+    "LOGO_RED": "#E07A5F",
+    "LOGO_BLACK": "#343434",
+}
+
+MANIM_COLORS_LIST = list(MANIM_COLORS_DICT.keys())
+
 CANVAS_WIDTH: int = 960
 CANVAS_HEIGHT: int = 540
 BASE_TEXT_SIZE: int = 32
@@ -67,21 +153,10 @@ def findfile(file_name: str, search_dir: str = ".") -> Optional[str]:
     return None
 
 def get_qt_color(color_name: str) -> QColor:
-    c = color_name.lower()
-    if c == "white": return QColor("#FFFFFF")
-    if c == "black": return QColor("#000000")
-    if c == "red": return QColor("#FC6255")
-    if c == "blue": return QColor("#58C4DD")
-    if c == "green": return QColor("#83C167")
-    if c == "yellow": return QColor("#FFFF00")
-    if c == "gold": return QColor("#F9A602")
-    if c == "purple": return QColor("#9A72AC")
-    if c == "grey": return QColor("#888888")
-    
+    if color_name in MANIM_COLORS_LIST:
+        return QColor(MANIM_COLORS_DICT[color_name])
     qt_c = QColor(color_name)
-    if qt_c.isValid():
-        return qt_c
-    return QColor("#FFFFFF") 
+    return qt_c if qt_c.isValid() else QColor("#FFFFFF")
 
 def render_latex_to_pixmap_mpl(latex_text: str, color_str: str = "#000000") -> Tuple[QPixmap, Optional[str]]:
     if not latex_text.strip():
@@ -231,57 +306,67 @@ class MobjectEditDialog(QDialog):
         self.layout: QFormLayout = QFormLayout(self)
         self.layout.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
         
+        # --- 1. 初始化所有控件 (先创建，后赋值/连接信号) ---
+
+        # 名称
         self.name_edit = QLineEdit()
         if mobject: self.name_edit.setText(mobject.name)
         elif existing_names is not None: self.name_edit.setText(f"{default_type}_{len(existing_names) + 1}")
+        
         self.type_label = QLabel(mobject.mob_type if mobject else default_type)
         
+        # 颜色相关控件
         self.color_row_container = QWidget()
         self.color_row_layout = QHBoxLayout(self.color_row_container)
         self.color_row_layout.setContentsMargins(0, 0, 0, 0)
         self.color_row_layout.setSpacing(5)
+
         self.color_mode_combo = QComboBox()
         self.color_mode_combo.addItems(["Manim内置", "自定义"])
         self.color_mode_combo.setFixedWidth(90)
-        self.color_mode_combo.currentIndexChanged.connect(self.toggle_color_ui)
+        
         self.builtin_color_combo = QComboBox()
         self.builtin_color_combo.addItems(MANIM_COLORS_LIST)
         self.builtin_color_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        self.builtin_color_combo.currentTextChanged.connect(self.refresh_preview)
+        
         self.custom_color_container = QWidget()
         self.custom_color_layout = QHBoxLayout(self.custom_color_container)
         self.custom_color_layout.setContentsMargins(0, 0, 0, 0)
         self.custom_color_layout.setSpacing(5)
+        
         self.custom_color_edit = QLineEdit()
         self.custom_color_edit.setPlaceholderText("#RRGGBB")
-        self.custom_color_edit.textChanged.connect(self.refresh_preview)
+        
         self.pick_color_btn = QToolButton()
         self.pick_color_btn.setIcon(qta.icon('fa5s.eye-dropper', color='#333'))
         self.pick_color_btn.setFixedSize(26, 26) 
         self.pick_color_btn.clicked.connect(self.open_color_picker)
+        
+        # 组装颜色布局
         self.custom_color_layout.addWidget(self.custom_color_edit)
         self.custom_color_layout.addWidget(self.pick_color_btn, alignment=Qt.AlignmentFlag.AlignVCenter)
         self.color_row_layout.addWidget(self.color_mode_combo, alignment=Qt.AlignmentFlag.AlignVCenter)
         self.color_row_layout.addWidget(self.builtin_color_combo, alignment=Qt.AlignmentFlag.AlignVCenter)
         self.color_row_layout.addWidget(self.custom_color_container, alignment=Qt.AlignmentFlag.AlignVCenter)
 
-        initial_color = mobject.color if mobject else "WHITE"
-        self.init_color_state(initial_color)
-
-        self.content_edit = QLineEdit("E=mc^2")
+        # 内容与字体
+        self.content_edit = QLineEdit("E=mc^2") # <--- 确保在连接信号前创建
         if mobject: self.content_edit.setText(mobject.content)
-        self.content_edit.textChanged.connect(self.refresh_preview)
+        
         self.font_combo = QFontComboBox()
         self.font_combo.clear()
         self.font_combo.addItems(Text.font_list())
         if mobject and mobject.font: self.font_combo.setCurrentFont(QFont(mobject.font))
+        
         self.content_label = QLabel("内容:")
         self.font_label = QLabel("字体:")
         
+        # 预览区域
         self.preview_area = QScrollArea()
         self.preview_area.setWidgetResizable(True)
         self.preview_area.setFixedHeight(140)
         self.preview_area.setVisible(False)
+        
         self.preview_label = QLabel("公式预览")
         self.preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.preview_label.setWordWrap(True)
@@ -289,18 +374,31 @@ class MobjectEditDialog(QDialog):
         self.preview_label.setStyleSheet(self.base_preview_style + "color: #888;")
         self.preview_area.setWidget(self.preview_label)
 
+        # 确定按钮
+        btn_ok = QPushButton("应用")
+        btn_ok.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_ok.setStyleSheet("background-color: #0078d4; color: white; border: none; padding: 6px; font-weight: bold;")
+        btn_ok.clicked.connect(self.validate_and_accept)
+
+        # --- 2. 添加到主布局 ---
         self.layout.addRow("类型:", self.type_label)
         self.layout.addRow("名称:", self.name_edit)
         self.layout.addRow("颜色:", self.color_row_container)
         self.layout.addRow(self.content_label, self.content_edit)
         self.layout.addRow(self.font_label, self.font_combo)
         self.layout.addRow(self.preview_area)
-        
-        btn_ok = QPushButton("应用")
-        btn_ok.setCursor(Qt.CursorShape.PointingHandCursor)
-        btn_ok.setStyleSheet("background-color: #0078d4; color: white; border: none; padding: 6px; font-weight: bold;")
-        btn_ok.clicked.connect(self.validate_and_accept)
         self.layout.addRow(btn_ok)
+
+        # --- 3. 连接信号 (此时所有控件已存在，触发信号不会报错) ---
+        self.color_mode_combo.currentIndexChanged.connect(self.toggle_color_ui)
+        self.builtin_color_combo.currentTextChanged.connect(self.refresh_preview)
+        self.custom_color_edit.textChanged.connect(self.refresh_preview)
+        self.content_edit.textChanged.connect(self.refresh_preview)
+
+        # --- 4. 初始化状态 (这会触发一次信号，但现在安全了) ---
+        initial_color = mobject.color if mobject else "WHITE"
+        self.init_color_state(initial_color)
+        
         self.update_fields(self.type_label.text())
         self.toggle_color_ui()
 
@@ -342,6 +440,9 @@ class MobjectEditDialog(QDialog):
             self.content_label.setText("文本:")
 
     def refresh_preview(self, _: Optional[Any] = None) -> None:
+        # 安全检查：防止未初始化时调用 (虽然调整顺序后基本不会发生，但加个保险)
+        if not hasattr(self, 'content_edit'): return
+
         if self.type_label.text() == "MathTex":
             self.update_preview(self.content_edit.text())
 
@@ -383,7 +484,7 @@ class MobjectEditDialog(QDialog):
             "content": self.content_edit.text(),
             "font": self.font_combo.currentFont().family()
         }
-    
+  
 class AnimationEditDialog(QDialog):
     def __init__(self, parent: Optional[QWidget] = None, mobjects: List[MobjectData] = [], animation: Optional[AnimationData] = None, default_type: str = "Create") -> None:
         super().__init__(parent)
