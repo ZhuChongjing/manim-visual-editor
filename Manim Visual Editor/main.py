@@ -2,7 +2,10 @@ import sys
 import os
 import uuid
 import copy
-from dataclasses import dataclass
+import ctypes
+import json  # 新增
+import winreg as reg
+from dataclasses import dataclass, asdict  # 新增 asdict
 from typing import Optional, List, Tuple, Dict, Any, Callable
 from decimal import Decimal
 from io import BytesIO
@@ -17,15 +20,22 @@ from PyQt6.QtWidgets import (
     QMessageBox, QAbstractItemView, QSizePolicy, QFontComboBox, 
     QProgressBar, QGraphicsRectItem, QSlider, QToolButton,
     QScrollArea, QColorDialog, QGraphicsLineItem, QStyleOptionGraphicsItem,
-    QGraphicsSceneMouseEvent
+    QGraphicsSceneMouseEvent, QStackedWidget, QButtonGroup,
+    QFileDialog
 )
-from PyQt6.QtCore import Qt, QSize, QProcess, pyqtSignal, QRectF, QByteArray, QPointF
+from PyQt6.QtCore import Qt, QSize, QProcess, pyqtSignal, QRectF, QByteArray, QPointF, QRunnable, QThreadPool, QObject, QTimer
 from PyQt6.QtGui import (
     QAction, QColor, QBrush, QPainter, QPixmap, QFont, QIcon, QMovie, 
     QPen, QFontMetrics, QKeySequence, QImage, QWheelEvent, QMouseEvent
 )
 import qtawesome as qta
 import matplotlib.pyplot as plt
+
+if sys.platform == "win32":
+    try:
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("ManimVisualEditor")
+    except Exception as e:
+        pass
 
 # === 配置与环境初始化 ===
 os.environ["QT_API"] = "pyqt6"
@@ -128,8 +138,6 @@ MANIM_COLORS_DICT = {
     "GRAY_BROWN": "#736357",
     "GREY_BROWN": "#736357",
 
-    # Colors used for Manim Community's logo and banner
-
     "LOGO_WHITE": "#ECE7E2",
     "LOGO_GREEN": "#87C2A5",
     "LOGO_BLUE": "#525893",
@@ -144,6 +152,7 @@ CANVAS_HEIGHT: int = 540
 BASE_TEXT_SIZE: int = 32
 MANIM_UNIT_PER_PIXEL: Decimal = Decimal(str(MathTex("x").height)) / Decimal(str(QSvgRenderer(str(tex_to_svg_file("$x$", tex_template=TexTemplate()))).viewBoxF().height()))
 SNAP_THRESHOLD_PIXELS: float = 10.0
+AVAILABLE_FONTS: List[str] = Text.font_list()
 
 # === 辅助函数 ===
 def findfile(file_name: str, search_dir: str = ".") -> Optional[str]:
@@ -175,7 +184,7 @@ def render_latex_to_pixmap_mpl(latex_text: str, color_str: str = "#000000") -> T
         image.loadFromData(buf.getvalue())
         plt.close(fig)
         buf.close()
-        if image.isNull(): return QPixmap(), "Render Error"
+        if image.isNull(): return QPixmap(), "Render Error: Image is null"
         return QPixmap.fromImage(image), None
     except Exception as e:
         if fig: plt.close(fig)
@@ -223,34 +232,377 @@ class AnimationData:
     replacement_name_snapshot: Optional[str] = None
     duration: float = 1.0 
 
-# === UI 组件 ===
+# === 组件: 侧边菜单按钮 ===
+class SideMenuButton(QToolButton):
+    def __init__(self, text, icon_name, parent=None):
+        super().__init__(parent)
+        self.setText(text)
+        self.setIcon(qta.icon(icon_name, color='#555'))
+        self.setIconSize(QSize(24, 24))
+        self.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextUnderIcon)
+        self.setCheckable(True)
+        self.setFixedSize(60, 60)
+        self.setStyleSheet("""
+            QToolButton {
+                border: none;
+                background-color: transparent;
+                color: #555;
+                font-size: 10pt;
+                padding: 5px;
+            }
+            QToolButton:hover {
+                background-color: #f0f0f0;
+            }
+            QToolButton:checked {
+                background-color: #e6f7ff;
+                color: #0078d4;
+                border-left: 3px solid #0078d4;
+            }
+        """)
+
+# === 组件: 右侧侧边栏 ===
+class RightSideBar(QWidget):
+    mode_changed = pyqtSignal(int) # 0: Animation, 1: Properties
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedWidth(60)
+        self.setStyleSheet("background-color: #ffffff; border-left: 1px solid #e0e0e0;")
+        
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(10)
+        
+        self.btn_group = QButtonGroup(self)
+        self.btn_group.setExclusive(True)
+        
+        layout.addStretch()
+        
+        self.btn_anim = SideMenuButton("动画", "fa5s.film", self)
+        self.btn_anim.setChecked(True) # 默认选中
+        self.btn_group.addButton(self.btn_anim, 0)
+        layout.addWidget(self.btn_anim)
+        
+        self.btn_prop = SideMenuButton("属性", "fa5s.sliders-h", self)
+        self.btn_group.addButton(self.btn_prop, 1)
+        layout.addWidget(self.btn_prop)
+        
+        layout.addStretch()
+        
+        self.btn_group.idClicked.connect(self.mode_changed.emit)
+
+# === 组件: 对象属性面板 ===
+class ObjectPropertyPanel(QWidget):
+    # 信号定义: (field_name, new_value, save_history)
+    property_changed = pyqtSignal(str, object, bool) 
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.current_mobject: Optional[MobjectData] = None
+        self.is_updating = False
+        
+        # --- 防抖动定时器 (仅用于Matplotlib预览) ---
+        self.preview_timer = QTimer()
+        self.preview_timer.setSingleShot(True)
+        self.preview_timer.setInterval(300) # 300ms 延迟
+        self.preview_timer.timeout.connect(self.trigger_async_preview)
+
+        # 主布局
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        
+        # 顶部标题
+        self.header_label = QLabel("对象属性", objectName="PanelHeader")
+        self.header_label.setStyleSheet("font-weight: bold; color: #0078d4; padding: 8px; background-color: #f9f9f9; border-bottom: 2px solid #0078d4;")
+        layout.addWidget(self.header_label)
+
+        # 内容容器
+        content_widget = QWidget()
+        content_layout = QVBoxLayout(content_widget)
+        content_layout.setContentsMargins(10, 10, 10, 10)
+        content_layout.setSpacing(10)
+
+        # 表单布局
+        self.form_layout = QFormLayout()
+        self.form_layout.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+        self.form_layout.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        
+        # 1. 类型和名称
+        self.type_label = QLabel("-")
+        self.name_edit = QLineEdit()
+        self.name_edit.editingFinished.connect(self.on_name_changed)
+
+        # 2. 颜色控制
+        self.color_row_container = QWidget()
+        self.color_row_layout = QHBoxLayout(self.color_row_container)
+        self.color_row_layout.setContentsMargins(0, 0, 0, 0)
+        self.color_row_layout.setSpacing(5)
+
+        self.color_mode_combo = QComboBox()
+        self.color_mode_combo.addItems(["Manim内置", "自定义"])
+        self.color_mode_combo.setFixedWidth(90)
+        self.color_mode_combo.currentIndexChanged.connect(self.toggle_color_ui)
+        
+        self.builtin_color_combo = QComboBox()
+        self.builtin_color_combo.addItems(MANIM_COLORS_LIST)
+        self.builtin_color_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.builtin_color_combo.activated.connect(self.on_color_changed)
+        
+        self.custom_color_container = QWidget()
+        custom_layout = QHBoxLayout(self.custom_color_container)
+        custom_layout.setContentsMargins(0,0,0,0)
+        self.custom_color_edit = QLineEdit()
+        self.custom_color_edit.setPlaceholderText("#RRGGBB")
+        self.custom_color_edit.editingFinished.connect(self.on_color_changed)
+        
+        self.pick_color_btn = QToolButton()
+        self.pick_color_btn.setIcon(qta.icon('fa5s.eye-dropper', color='#333'))
+        self.pick_color_btn.setFixedSize(26, 26)
+        self.pick_color_btn.clicked.connect(self.open_color_picker)
+        
+        custom_layout.addWidget(self.custom_color_edit)
+        custom_layout.addWidget(self.pick_color_btn)
+        
+        self.color_row_layout.addWidget(self.color_mode_combo, alignment=Qt.AlignmentFlag.AlignVCenter)
+        self.color_row_layout.addWidget(self.builtin_color_combo, alignment=Qt.AlignmentFlag.AlignVCenter)
+        self.color_row_layout.addWidget(self.custom_color_container, alignment=Qt.AlignmentFlag.AlignVCenter)
+
+        # 3. 内容输入框
+        self.content_label = QLabel("内容:")
+        self.content_edit = QLineEdit()
+        self.content_edit.setPlaceholderText("输入文本或LaTeX公式")
+        # textEdited: 仅触发本地 Matplotlib 预览
+        self.content_edit.textEdited.connect(self.on_content_edited_realtime)
+        # returnPressed: 触发画布更新 (普通文本按回车生效)
+        self.content_edit.returnPressed.connect(self.on_apply_content_to_canvas)
+        
+        # 4. 字体
+        self.font_label = QLabel("字体:")
+        self.font_combo = QFontComboBox()
+        self.font_combo.clear()
+        self.font_combo.addItems(AVAILABLE_FONTS)
+        self.font_combo.currentFontChanged.connect(self.on_font_changed)
+        
+        # 5. 预览区域
+        self.preview_area = QScrollArea()
+        self.preview_area.setWidgetResizable(True)
+        self.preview_area.setFixedHeight(140)
+        
+        self.preview_label = QLabel("公式预览")
+        self.preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.preview_label.setWordWrap(True)
+        self.base_preview_style = "background-color: black; border: 1px solid #444;"
+        self.preview_label.setStyleSheet(self.base_preview_style + "color: #888;")
+        self.preview_area.setWidget(self.preview_label)
+
+        # 6. 更新画布按钮 (蓝色)
+        self.btn_apply = QPushButton("更新预览到画布")
+        self.btn_apply.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_apply.setIcon(qta.icon('fa5s.check', color='white'))
+        self.btn_apply.setStyleSheet("""
+            QPushButton {
+                background-color: #0078d4; 
+                color: white; 
+                font-weight: bold; 
+                padding: 8px; 
+                border-radius: 4px;
+                border: none;
+            }
+            QPushButton:hover {
+                background-color: #106ebe;
+            }
+            QPushButton:pressed {
+                background-color: #005a9e;
+            }
+        """)
+        self.btn_apply.clicked.connect(self.on_apply_content_to_canvas)
+
+        # 添加到布局
+        self.form_layout.addRow("类型:", self.type_label)
+        self.form_layout.addRow("名称:", self.name_edit)
+        self.form_layout.addRow("颜色:", self.color_row_container)
+        self.form_layout.addRow(self.content_label, self.content_edit)
+        self.form_layout.addRow(self.font_label, self.font_combo)
+        
+        content_layout.addLayout(self.form_layout)
+        content_layout.addWidget(self.preview_area)
+        content_layout.addWidget(self.btn_apply) 
+        
+        content_layout.addStretch()
+        layout.addWidget(content_widget)
+        
+        # 空状态层
+        self.empty_state_label = QLabel("选择对象以编辑属性", self)
+        self.empty_state_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.empty_state_label.setStyleSheet("background: #f3f3f3; color: #888; font-size: 10pt;")
+        
+        self.set_mobject(None)
+
+    def resizeEvent(self, event):
+        self.empty_state_label.setGeometry(0, self.header_label.height(), self.width(), self.height() - self.header_label.height())
+        super().resizeEvent(event)
+
+    def set_mobject(self, mobject: Optional[MobjectData]):
+        self.current_mobject = mobject
+        
+        if not mobject:
+            self.empty_state_label.show()
+            self.empty_state_label.raise_()
+            return
+        
+        self.empty_state_label.hide()
+        self.is_updating = True
+        
+        self.type_label.setText(mobject.mob_type)
+        self.name_edit.setText(mobject.name)
+        
+        upper_color = mobject.color.upper()
+        if upper_color in MANIM_COLORS_LIST:
+            self.color_mode_combo.setCurrentIndex(0)
+            idx = self.builtin_color_combo.findText(upper_color)
+            if idx >= 0: self.builtin_color_combo.setCurrentIndex(idx)
+        else:
+            self.color_mode_combo.setCurrentIndex(1)
+            self.custom_color_edit.setText(mobject.color)
+        
+        self.toggle_color_ui()
+        
+        is_text = (mobject.mob_type == "Text")
+        is_math = (mobject.mob_type == "MathTex")
+        
+        self.content_label.setVisible(is_text or is_math)
+        self.content_edit.setVisible(is_text or is_math)
+        self.content_edit.setText(mobject.content)
+        
+        self.font_label.setVisible(is_text)
+        self.font_combo.setVisible(is_text)
+        if is_text and mobject.font:
+            self.font_combo.setCurrentFont(QFont(mobject.font))
+            
+        self.preview_area.setVisible(is_math)
+        
+        # --- [修改] 仅当对象为 MathTex 时显示更新按钮，其他类型（如 Text）按回车即可 ---
+        self.btn_apply.setVisible(is_math)
+        
+        if is_math:
+            self.content_label.setText("LaTeX:")
+            self.refresh_preview()
+        else:
+            self.content_label.setText("文本:")
+            
+        self.is_updating = False
+
+    def toggle_color_ui(self):
+        is_builtin = (self.color_mode_combo.currentIndex() == 0)
+        self.builtin_color_combo.setVisible(is_builtin)
+        self.custom_color_container.setVisible(not is_builtin)
+        if not self.is_updating:
+            self.on_color_changed()
+
+    def get_current_color(self) -> str:
+        if self.color_mode_combo.currentIndex() == 0:
+            return self.builtin_color_combo.currentText()
+        return self.custom_color_edit.text().strip()
+
+    def on_name_changed(self):
+        if self.is_updating or not self.current_mobject: return
+        val = self.name_edit.text().strip()
+        if val and val != self.current_mobject.name:
+            self.property_changed.emit("name", val, True)
+
+    def on_color_changed(self):
+        if self.is_updating or not self.current_mobject: return
+        val = self.get_current_color()
+        if val != self.current_mobject.color:
+            self.property_changed.emit("color", val, True)
+            if self.current_mobject.mob_type == "MathTex":
+                self.refresh_preview()
+
+    def on_content_edited_realtime(self, text):
+        if self.is_updating or not self.current_mobject: return
+        if self.current_mobject.mob_type == "MathTex":
+            self.preview_timer.start()
+
+    def on_apply_content_to_canvas(self):
+        if self.is_updating or not self.current_mobject: return
+        new_text = self.content_edit.text()
+        if new_text != self.current_mobject.content:
+            self.property_changed.emit("content", new_text, True)
+        if self.current_mobject.mob_type == "MathTex":
+            self.trigger_async_preview()
+
+    def on_font_changed(self, font):
+        if self.is_updating or not self.current_mobject: return
+        val = font.family()
+        if val != self.current_mobject.font:
+            self.property_changed.emit("font", val, True)
+
+    def open_color_picker(self):
+        current = self.custom_color_edit.text()
+        c = QColorDialog.getColor(QColor(current) if QColor(current).isValid() else QColor("white"), self)
+        if c.isValid():
+            self.custom_color_edit.setText(c.name().upper())
+            self.on_color_changed()
+
+    def trigger_async_preview(self):
+        if not self.current_mobject or self.current_mobject.mob_type != "MathTex": return
+        latex = self.content_edit.text()
+        color = self.get_current_color()
+        self.preview_label.setText("渲染中...")
+        self.preview_label.setStyleSheet(self.base_preview_style + "color: #888;")
+        worker = MatplotlibWorker(latex, color)
+        worker.signals.finished.connect(self.on_preview_rendered)
+        QThreadPool.globalInstance().start(worker)
+
+    def on_preview_rendered(self, pixmap, error):
+        if error:
+            self.preview_label.setText(str(error).strip())
+            self.preview_label.setStyleSheet(self.base_preview_style + "color: #FF5555; padding: 5px; font-size: 9pt;")
+        elif pixmap:
+            w = self.preview_area.width() - 25
+            if pixmap.width() > w:
+                pixmap = pixmap.scaledToWidth(w, Qt.TransformationMode.SmoothTransformation)
+            self.preview_label.setStyleSheet(self.base_preview_style)
+            self.preview_label.setPixmap(pixmap)
+
+    def refresh_preview(self):
+        self.trigger_async_preview()
+
+# === 核心画布组件 ===
 class GifItemWidget(QWidget):
     def __init__(self, text: str, gif_path: Optional[str] = None, icon_fallback: Optional[str] = None, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
-        layout = QHBoxLayout(self)
-        layout.setContentsMargins(5, 5, 5, 5)
-        layout.setSpacing(10)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(5, 10, 5, 10)
+        layout.setSpacing(8)
+        layout.setAlignment(Qt.AlignmentFlag.AlignCenter) 
+        
         self.icon_label = QLabel()
-        self.icon_label.setFixedSize(40, 40)
-        self.icon_label.setStyleSheet("border: 1px solid #ccc; background: #eee; border-radius: 4px;")
+        self.icon_label.setFixedSize(60, 60)
+        self.icon_label.setStyleSheet("border: 1px solid #ddd; background: #f9f9f9; border-radius: 8px;")
         self.icon_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        
         if gif_path and os.path.exists(gif_path):
             movie = QMovie(gif_path)
-            movie.setScaledSize(QSize(38, 38))
+            movie.setScaledSize(QSize(60, 60))
             self.icon_label.setMovie(movie)
             movie.start()
         elif icon_fallback:
-             self.icon_label.setPixmap(qta.icon(icon_fallback, color='#555').pixmap(24, 24))
+             self.icon_label.setPixmap(qta.icon(icon_fallback, color='#555').pixmap(40, 40))
         else:
             self.icon_label.setText("GIF")
-        layout.addWidget(self.icon_label)
+        
+        layout.addWidget(self.icon_label, alignment=Qt.AlignmentFlag.AlignCenter)
+        
         self.text_label = QLabel(text)
-        self.text_label.setStyleSheet("font-weight: bold; font-size: 11pt;")
-        layout.addWidget(self.text_label)
-        layout.addStretch()
+        self.text_label.setStyleSheet("font-weight: bold; font-size: 10pt; color: #333;")
+        self.text_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.text_label.setWordWrap(True) 
+        
+        layout.addWidget(self.text_label, alignment=Qt.AlignmentFlag.AlignCenter)
 
 class JumpSlider(QSlider):
-    """支持点击跳转的滑块"""
     def mousePressEvent(self, event: QMouseEvent) -> None:
         if event.button() == Qt.MouseButton.LeftButton:
             if self.orientation() == Qt.Orientation.Horizontal:
@@ -266,27 +618,56 @@ class TypeSelectorDialog(QDialog):
     def __init__(self, title: str, items: List[Tuple[str, Optional[str], Optional[str]]], parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self.setWindowTitle(title)
-        self.resize(350, 450)
+        self.resize(535, 500)
         self.selected_item: Optional[str] = None
+        
         layout = QVBoxLayout(self)
         layout.addWidget(QLabel("请选择类型:"))
+        
         self.list_widget = QListWidget()
+        self.list_widget.setViewMode(QListWidget.ViewMode.IconMode)
+        self.list_widget.setResizeMode(QListWidget.ResizeMode.Adjust)
+        self.list_widget.setMovement(QListWidget.Movement.Static) 
+        self.list_widget.setSpacing(10)
+        self.list_widget.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.list_widget.setStyleSheet("""
+            QListWidget { background-color: #f0f0f0; border: none; }
+            QListWidget::item { 
+                background-color: white; 
+                border: 1px solid #ccc; 
+                border-radius: 6px; 
+            }
+            QListWidget::item:hover { 
+                background-color: #e6f7ff; 
+                border: 1px solid #0078d4; 
+            }
+            QListWidget::item:selected { 
+                background-color: #cce8ff; 
+                border: 2px solid #0078d4; 
+            }
+        """)
+
         for item_data in items:
             display_text, gif_path, icon_fallback = item_data
             lw_item = QListWidgetItem()
-            lw_item.setSizeHint(QSize(0, 55))
+            lw_item.setSizeHint(QSize(110, 120)) 
             lw_item.setData(Qt.ItemDataRole.UserRole, display_text)
             self.list_widget.addItem(lw_item)
             widget = GifItemWidget(display_text, gif_path, icon_fallback)
+            widget.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+            widget.setStyleSheet("background: transparent;") 
             self.list_widget.setItemWidget(lw_item, widget)
+            
         self.list_widget.itemDoubleClicked.connect(self.accept_selection)
         layout.addWidget(self.list_widget)
+        
         btn_layout = QHBoxLayout()
         btn_cancel = QPushButton("取消")
         btn_cancel.clicked.connect(self.reject)
         btn_ok = QPushButton("确定")
-        btn_ok.setStyleSheet("background-color: #0078d4; color: white; border: none;")
+        btn_ok.setStyleSheet("background-color: #0078d4; color: white; border: none; padding: 6px 15px; font-weight: bold;")
         btn_ok.clicked.connect(self.accept_selection)
+        
         btn_layout.addStretch()
         btn_layout.addWidget(btn_cancel)
         btn_layout.addWidget(btn_ok)
@@ -297,7 +678,12 @@ class TypeSelectorDialog(QDialog):
         if current:
             self.selected_item = current.data(Qt.ItemDataRole.UserRole)
             self.accept()
-
+        else:
+            selected_items = self.list_widget.selectedItems()
+            if selected_items:
+                self.selected_item = selected_items[0].data(Qt.ItemDataRole.UserRole)
+                self.accept()
+                
 class MobjectEditDialog(QDialog):
     def __init__(self, parent: Optional[QWidget] = None, mobject: Optional[MobjectData] = None, existing_names: Optional[List[MobjectData]] = None, default_type: str = "Square") -> None:
         super().__init__(parent)
@@ -306,16 +692,12 @@ class MobjectEditDialog(QDialog):
         self.layout: QFormLayout = QFormLayout(self)
         self.layout.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
         
-        # --- 1. 初始化所有控件 (先创建，后赋值/连接信号) ---
-
-        # 名称
         self.name_edit = QLineEdit()
         if mobject: self.name_edit.setText(mobject.name)
         elif existing_names is not None: self.name_edit.setText(f"{default_type}_{len(existing_names) + 1}")
         
         self.type_label = QLabel(mobject.mob_type if mobject else default_type)
         
-        # 颜色相关控件
         self.color_row_container = QWidget()
         self.color_row_layout = QHBoxLayout(self.color_row_container)
         self.color_row_layout.setContentsMargins(0, 0, 0, 0)
@@ -342,15 +724,13 @@ class MobjectEditDialog(QDialog):
         self.pick_color_btn.setFixedSize(26, 26) 
         self.pick_color_btn.clicked.connect(self.open_color_picker)
         
-        # 组装颜色布局
         self.custom_color_layout.addWidget(self.custom_color_edit)
         self.custom_color_layout.addWidget(self.pick_color_btn, alignment=Qt.AlignmentFlag.AlignVCenter)
         self.color_row_layout.addWidget(self.color_mode_combo, alignment=Qt.AlignmentFlag.AlignVCenter)
         self.color_row_layout.addWidget(self.builtin_color_combo, alignment=Qt.AlignmentFlag.AlignVCenter)
         self.color_row_layout.addWidget(self.custom_color_container, alignment=Qt.AlignmentFlag.AlignVCenter)
 
-        # 内容与字体
-        self.content_edit = QLineEdit("E=mc^2") # <--- 确保在连接信号前创建
+        self.content_edit = QLineEdit("E=mc^2") 
         if mobject: self.content_edit.setText(mobject.content)
         
         self.font_combo = QFontComboBox()
@@ -361,7 +741,6 @@ class MobjectEditDialog(QDialog):
         self.content_label = QLabel("内容:")
         self.font_label = QLabel("字体:")
         
-        # 预览区域
         self.preview_area = QScrollArea()
         self.preview_area.setWidgetResizable(True)
         self.preview_area.setFixedHeight(140)
@@ -374,13 +753,11 @@ class MobjectEditDialog(QDialog):
         self.preview_label.setStyleSheet(self.base_preview_style + "color: #888;")
         self.preview_area.setWidget(self.preview_label)
 
-        # 确定按钮
         btn_ok = QPushButton("应用")
         btn_ok.setCursor(Qt.CursorShape.PointingHandCursor)
         btn_ok.setStyleSheet("background-color: #0078d4; color: white; border: none; padding: 6px; font-weight: bold;")
         btn_ok.clicked.connect(self.validate_and_accept)
 
-        # --- 2. 添加到主布局 ---
         self.layout.addRow("类型:", self.type_label)
         self.layout.addRow("名称:", self.name_edit)
         self.layout.addRow("颜色:", self.color_row_container)
@@ -389,13 +766,11 @@ class MobjectEditDialog(QDialog):
         self.layout.addRow(self.preview_area)
         self.layout.addRow(btn_ok)
 
-        # --- 3. 连接信号 (此时所有控件已存在，触发信号不会报错) ---
         self.color_mode_combo.currentIndexChanged.connect(self.toggle_color_ui)
         self.builtin_color_combo.currentTextChanged.connect(self.refresh_preview)
         self.custom_color_edit.textChanged.connect(self.refresh_preview)
         self.content_edit.textChanged.connect(self.refresh_preview)
 
-        # --- 4. 初始化状态 (这会触发一次信号，但现在安全了) ---
         initial_color = mobject.color if mobject else "WHITE"
         self.init_color_state(initial_color)
         
@@ -440,9 +815,7 @@ class MobjectEditDialog(QDialog):
             self.content_label.setText("文本:")
 
     def refresh_preview(self, _: Optional[Any] = None) -> None:
-        # 安全检查：防止未初始化时调用 (虽然调整顺序后基本不会发生，但加个保险)
         if not hasattr(self, 'content_edit'): return
-
         if self.type_label.text() == "MathTex":
             self.update_preview(self.content_edit.text())
 
@@ -533,8 +906,57 @@ class AnimationEditDialog(QDialog):
             "replacement_name": rep_name,
             "duration": dur
         }
+    
+class WorkerSignals(QObject):
+    # result(object), error(str)
+    finished = pyqtSignal(object, str)
 
-# === 核心画布组件 ===
+class MatplotlibWorker(QRunnable):
+    def __init__(self, latex_text, color_str):
+        super().__init__()
+        self.latex_text = latex_text
+        self.color_str = color_str
+        self.signals = WorkerSignals()
+
+    def run(self):
+        try:
+            pixmap, error = render_latex_to_pixmap_mpl(self.latex_text, self.color_str)
+            if error:
+                self.signals.finished.emit(None, error)
+            else:
+                self.signals.finished.emit(pixmap, None)
+        except Exception as e:
+            import traceback
+            self.signals.finished.emit(None, traceback.format_exc())
+
+class ManimSvgWorker(QRunnable):
+    def __init__(self, latex_text, color_str):
+        super().__init__()
+        self.latex_text = latex_text
+        self.color_str = color_str
+        self.signals = WorkerSignals()
+
+    def run(self):
+        try:
+            tex_template = TexTemplate()
+            svg_file = tex_to_svg_file(f"${self.latex_text}$", tex_template=tex_template)
+            
+            if not os.path.exists(svg_file):
+                self.signals.finished.emit(None, "LaTeX Compile Failed: File not found")
+                return
+
+            with open(svg_file, 'r', encoding='utf-8') as f:
+                svg_data = f.read()
+            
+            qt_color = get_qt_color(self.color_str)
+            hex_color = qt_color.name()
+            if "<svg " in svg_data:
+                svg_data = svg_data.replace("<svg ", f'<svg fill="{hex_color}" stroke="none" ')
+            
+            self.signals.finished.emit(svg_data.encode('utf-8'), None)
+            
+        except Exception as e:
+            self.signals.finished.emit(None, str(e))
 
 class ResizeHandle(QGraphicsRectItem):
     def __init__(self, parent: QGraphicsItem, cursor_shape: Qt.CursorShape) -> None:
@@ -564,12 +986,13 @@ class ResizeHandle(QGraphicsRectItem):
             parent.on_manipulation_end()
 
 class VisualMobjectItem(QGraphicsItem):
-    def __init__(self, mobject_data: MobjectData, scene_scale: float, on_move_callback: Optional[Callable[[str], None]] = None, change_callback: Optional[Callable[[str], None]] = None) -> None:
+    def __init__(self, mobject_data: MobjectData, scene_scale: float, on_move_callback: Optional[Callable[[str], None]] = None, change_callback: Optional[Callable[[str], None]] = None, render_finish_callback: Optional[Callable[[], None]] = None) -> None:
         super().__init__()
         self.mob_data = mobject_data
         self.scene_scale = Decimal(str(scene_scale)) 
         self.on_move_callback = on_move_callback
         self.change_callback = change_callback 
+        self.render_finish_callback = render_finish_callback 
         
         self.setZValue(1)
         self.setFlags(QGraphicsItem.GraphicsItemFlag.ItemIsMovable | 
@@ -580,7 +1003,10 @@ class VisualMobjectItem(QGraphicsItem):
         self.last_content_signature: Optional[Tuple[str, str, str, str]] = None 
         self.has_render_error = False
         self.render_error_msg = ""
-        self.update_content()
+        self.last_valid_bounding_rect: Optional[QRectF] = None
+        
+        self.update_content(sync=True)
+        
         self.setScale(self.mob_data.scale)
         self.update_position_from_data()
         self.update_tooltip()
@@ -588,35 +1014,73 @@ class VisualMobjectItem(QGraphicsItem):
         self.is_resizing = False
         self.is_manipulating = False
 
-    def update_content(self) -> None:
+    def update_content(self, sync: bool = False) -> None:
         sig = (self.mob_data.content, self.mob_data.color, self.mob_data.font, self.mob_data.mob_type)
         if sig == self.last_content_signature: return
         self.last_content_signature = sig
-        self.prepareGeometryChange()
-        self.has_render_error = False
-        self.svg_renderer = None
-        if self.mob_data.mob_type == "MathTex":
+        
+        if self.mob_data.mob_type != "MathTex":
+            self.prepareGeometryChange()
+            self.svg_renderer = None
+            self.has_render_error = False
+            self._bounding_rect = self._calculate_bounding_rect()
+            if self.isSelected(): self.create_handles()
+            self.update()
+            return
+
+        if sync:
+            self.prepareGeometryChange()
             renderer, error = create_manim_svg_renderer(self.mob_data.content, self.mob_data.color)
             if error:
                 self.has_render_error = True
                 self.render_error_msg = error
             else:
+                self.has_render_error = False
                 self.svg_renderer = renderer
+            self._bounding_rect = self._calculate_bounding_rect()
+            if self.isSelected(): self.create_handles()
+            self.update()
+        else:
+            worker = ManimSvgWorker(self.mob_data.content, self.mob_data.color)
+            worker.signals.finished.connect(self.on_svg_rendered)
+            QThreadPool.globalInstance().start(worker)
+
+    def on_svg_rendered(self, svg_bytes, error):
+        self.prepareGeometryChange()
+        
+        if error:
+            self.has_render_error = True
+            self.render_error_msg = error
+        else:
+            self.has_render_error = False
+            self.render_error_msg = ""
+            self.svg_renderer = QSvgRenderer(QByteArray(svg_bytes))
+        
         self._bounding_rect = self._calculate_bounding_rect()
+        
+        if self.isSelected():
+            self.create_handles()
+            
+        self.update()
+
+        if self.render_finish_callback:
+            self.render_finish_callback()
 
     def _calculate_bounding_rect(self) -> QRectF:
         factor = Decimal("1.0") / self.scene_scale
+        new_rect = None
+        
         if self.mob_data.mob_type == "Square":
             s = Decimal("2.0") * factor
-            return QRectF(-s/2, -s/2, s, s)
+            new_rect = QRectF(-s/2, -s/2, s, s)
         elif self.mob_data.mob_type == "Circle":
             d = Decimal("2.0") * factor 
-            return QRectF(-d/2, -d/2, d, d)
+            new_rect = QRectF(-d/2, -d/2, d, d)
         elif self.mob_data.mob_type == "Text":
             font = QFont(self.mob_data.font, BASE_TEXT_SIZE)
             fm = QFontMetrics(font)
             rect = fm.boundingRect(self.mob_data.content)
-            return QRectF(-rect.width()/2, -rect.height()/2, rect.width(), rect.height())
+            new_rect = QRectF(-rect.width()/2, -rect.height()/2, rect.width(), rect.height())
         elif self.mob_data.mob_type == "MathTex":
             if self.svg_renderer and self.svg_renderer.isValid():
                 vbox = self.svg_renderer.viewBoxF()
@@ -624,10 +1088,17 @@ class VisualMobjectItem(QGraphicsItem):
                 height_in_units = Decimal(str(vbox.height())) * MANIM_UNIT_PER_PIXEL
                 display_w = width_in_units * factor
                 display_h = height_in_units * factor
-                return QRectF(-display_w/2, -display_h/2, display_w, display_h)
+                new_rect = QRectF(-display_w/2, -display_h/2, display_w, display_h)
             else:
-                return QRectF(-50, -25, 100, 50)
-        return QRectF(-50, -50, 100, 100)
+                if self.last_valid_bounding_rect:
+                    return self.last_valid_bounding_rect
+                return QRectF(-60, -20, 120, 40)
+        
+        if new_rect is None:
+            new_rect = QRectF(-50, -50, 100, 100)
+            
+        self.last_valid_bounding_rect = new_rect
+        return new_rect
 
     def boundingRect(self) -> QRectF:
         base_rect = self._bounding_rect
@@ -638,11 +1109,24 @@ class VisualMobjectItem(QGraphicsItem):
     def paint(self, painter: QPainter, option: QStyleOptionGraphicsItem, widget: Optional[QWidget]) -> None:
         color = get_qt_color(self.mob_data.color)
         
-        # 错误处理显示
         if self.has_render_error and self.mob_data.mob_type == "MathTex":
-            painter.setPen(QPen(Qt.GlobalColor.red, 2))
+            painter.setPen(QPen(Qt.GlobalColor.red, 2, Qt.PenStyle.DashLine))
             painter.drawRect(self._bounding_rect)
-            painter.drawText(self._bounding_rect, Qt.AlignmentFlag.AlignCenter, "LaTeX Error")
+            
+            painter.setPen(QPen(Qt.GlobalColor.red))
+            font = painter.font()
+            font.setPixelSize(14) 
+            font.setBold(True)
+            painter.setFont(font)
+            
+            painter.drawText(self._bounding_rect, Qt.AlignmentFlag.AlignCenter, "LaTeX语法错误")
+            
+            if self.isSelected():
+                sel_pen = QPen(Qt.GlobalColor.white, 1, Qt.PenStyle.SolidLine)
+                sel_pen.setCosmetic(True)
+                painter.setPen(sel_pen)
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+                painter.drawRect(self.boundingRect())
             return
             
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
@@ -650,14 +1134,11 @@ class VisualMobjectItem(QGraphicsItem):
         
         rect = self._bounding_rect
         
-        # 创建一个 "Cosmetic" 画笔
-        # setCosmetic(True) 意味着画笔宽度是基于屏幕像素的，不受 Item 缩放影响
         shape_pen = QPen(color, 2)
         shape_pen.setCosmetic(True) 
         
         if self.mob_data.mob_type == "Square":
             painter.setPen(shape_pen)
-            # 设置半透明填充
             c = QColor(color)
             c.setAlphaF(0.5)
             painter.setBrush(QBrush(c))
@@ -671,7 +1152,6 @@ class VisualMobjectItem(QGraphicsItem):
             painter.drawEllipse(rect)
             
         elif self.mob_data.mob_type == "Text":
-            # 文本通常不需要边框，只需要颜色
             painter.setPen(QPen(color))
             font = QFont(self.mob_data.font, BASE_TEXT_SIZE)
             painter.setFont(font)
@@ -681,12 +1161,9 @@ class VisualMobjectItem(QGraphicsItem):
             if self.svg_renderer and self.svg_renderer.isValid():
                 self.svg_renderer.render(painter, rect)
 
-        # 选中状态的边框
         if self.isSelected():
-            # 选中框也应该是 Cosmetic 的，防止缩放后虚线变得极粗
             sel_pen = QPen(Qt.GlobalColor.white, 1, Qt.PenStyle.SolidLine)
             sel_pen.setCosmetic(True)
-            
             painter.setPen(sel_pen)
             painter.setBrush(Qt.BrushStyle.NoBrush)
             painter.drawRect(self.boundingRect())
@@ -699,25 +1176,20 @@ class VisualMobjectItem(QGraphicsItem):
         
     def itemChange(self, change: QGraphicsItem.GraphicsItemChange, value: Any) -> Any:
         if change == QGraphicsItem.GraphicsItemChange.ItemPositionChange and not self.is_resizing:
-            # 智能吸附逻辑：只有当用户拖动时（我是Grabber）才触发
             views = self.scene().views()
             if views and isinstance(views[0], ManimCanvas) and self.scene().mouseGrabberItem() == self:
                 canvas = views[0]
                 new_pos = canvas.get_snapped_position(self, value)
-                
                 self.mob_data.x = round(Decimal(str(new_pos.x())) * self.scene_scale, 2)
                 self.mob_data.y = round(-Decimal(str(new_pos.y())) * self.scene_scale, 2)
                 self.update_tooltip()
                 if self.on_move_callback: self.on_move_callback(self.mob_data.id)
                 return new_pos
-
-            # 默认逻辑
             new_pos = value
             self.mob_data.x = round(Decimal(str(new_pos.x())) * self.scene_scale, 2)
             self.mob_data.y = round(-Decimal(str(new_pos.y())) * self.scene_scale, 2)
             self.update_tooltip()
             if self.on_move_callback: self.on_move_callback(self.mob_data.id)
-            
         elif change == QGraphicsItem.GraphicsItemChange.ItemSelectedChange:
             if value: self.create_handles()
             else: self.remove_handles()
@@ -744,7 +1216,6 @@ class VisualMobjectItem(QGraphicsItem):
         for h in self.handles: self.scene().removeItem(h)
         self.handles.clear()
 
-    # --- 交互事件处理 (撤销/重做支持) ---
     def on_manipulation_start(self) -> None:
         if not self.is_manipulating:
             self.is_manipulating = True
@@ -762,7 +1233,6 @@ class VisualMobjectItem(QGraphicsItem):
     def mouseReleaseEvent(self, event: QGraphicsSceneMouseEvent) -> None:
         super().mouseReleaseEvent(event)
         self.on_manipulation_end()
-        # 拖动结束清除辅助线
         views = self.scene().views()
         if views and isinstance(views[0], ManimCanvas):
             views[0].clear_guides()
@@ -788,6 +1258,7 @@ class VisualMobjectItem(QGraphicsItem):
 
 class ManimCanvas(QGraphicsView):
     scale_changed = pyqtSignal(int) 
+    item_render_changed = pyqtSignal() 
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -814,7 +1285,6 @@ class ManimCanvas(QGraphicsView):
         self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.current_zoom_percent = 100
 
-        # --- 智能对齐线 ---
         self.guide_lines: List[QGraphicsLineItem] = [] 
         self.snap_threshold = SNAP_THRESHOLD_PIXELS
 
@@ -825,27 +1295,18 @@ class ManimCanvas(QGraphicsView):
 
     def draw_guide_line(self, x1: float, y1: float, x2: float, y2: float) -> None:
         line = QGraphicsLineItem(x1, y1, x2, y2)
-        # 设置对齐线颜色为 #FF8800 (橙色)
         pen = QPen(QColor("#FF8800"), 1, Qt.PenStyle.DashLine) 
         line.setPen(pen)
-        line.setZValue(1000) # 最上层
+        line.setZValue(1000)
         self.scene.addItem(line)
         self.guide_lines.append(line)
 
     def get_snapped_position(self, moving_item: VisualMobjectItem, proposed_pos: QPointF) -> QPointF:
-        """
-        计算吸附后的位置，并绘制辅助线。
-        修正：直接使用 _bounding_rect (真实几何) 而非 boundingRect() (含Padding)，解决对齐缝隙问题。
-        """
         self.clear_guides()
         
-        # 1. 获取移动物体在预测位置的 *真实* 几何边界 (无 Padding)
-        # VisualMobjectItem 的 _bounding_rect 是局部未缩放坐标
         local_rect = moving_item._bounding_rect
         scale = moving_item.scale()
         
-        # 计算预测的场景坐标边界
-        # 假设局部原点 (0,0) 是物体中心
         cx = proposed_pos.x()
         cy = proposed_pos.y()
         
@@ -854,28 +1315,18 @@ class ManimCanvas(QGraphicsView):
         my_top = cy + local_rect.top() * scale
         my_bottom = cy + local_rect.bottom() * scale
         
-        # 待检测的关键点 [左, 中, 右]
         x_candidates = [my_left, cx, my_right]
         y_candidates = [my_top, cy, my_bottom]
 
-        # 2. 收集所有对齐目标 (也必须是 无Padding 的真实边界)
         targets = []
-        
-        # (A) 画布背景 (BlackBoard)
-        # 使用 rect() 而非 boundingRect() 来排除边框笔触宽度
         targets.append(self.black_board.mapRectToScene(self.black_board.rect()))
         
-        # (B) 其他可见物体
         for other_id, other_item in self.items_map.items():
             if other_item == moving_item: continue
             if not other_item.isVisible(): continue
-            
-            # 关键修正：使用 other_item._bounding_rect 并映射到场景
-            # 这会自动处理其他物体的当前位置、缩放，且不包含 Padding
             real_rect = other_item.mapRectToScene(other_item._bounding_rect)
             targets.append(real_rect)
 
-        # 3. 初始化计算变量
         final_dx = 0.0
         final_dy = 0.0
         min_dist_x = self.snap_threshold
@@ -884,7 +1335,6 @@ class ManimCanvas(QGraphicsView):
         snap_x_draw_params = None 
         snap_y_draw_params = None
 
-        # --- X轴扫描 (左右对齐) ---
         target: QRectF
         for target in targets:
             t_pts = [target.left(), target.center().x(), target.right()]
@@ -896,12 +1346,10 @@ class ManimCanvas(QGraphicsView):
                         min_dist_x = dist
                         final_dx = target_val - my_val
                         
-                        # 计算辅助线绘制范围 (取Y轴并集)
                         union_top = min(my_top, target.top())
                         union_bottom = max(my_bottom, target.bottom())
                         snap_x_draw_params = (target_val, union_top, union_bottom)
 
-        # --- Y轴扫描 (上下对齐) ---
         for target in targets:
             t_pts = [target.top(), target.center().y(), target.bottom()]
             
@@ -912,19 +1360,15 @@ class ManimCanvas(QGraphicsView):
                         min_dist_y = dist
                         final_dy = target_val - my_val
                         
-                        # 计算辅助线绘制范围 (取X轴并集)
-                        # 这里加上 final_dx 预测值，让横线跟随吸附后的X位置
                         pred_left = my_left + final_dx
                         pred_right = my_right + final_dx
                         union_left = min(pred_left, target.left())
                         union_right = max(pred_right, target.right())
                         snap_y_draw_params = (target_val, union_left, union_right)
 
-        # 4. 应用吸附结果
         new_x = cx + final_dx
         new_y = cy + final_dy
 
-        # 绘制辅助线
         if snap_x_draw_params:
             x, y1, y2 = snap_x_draw_params
             self.draw_guide_line(x, y1 - 20, x, y2 + 20)
@@ -960,29 +1404,20 @@ class ManimCanvas(QGraphicsView):
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
         if event.button() == Qt.MouseButton.MiddleButton:
-            # 中键：平移画布
             self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
-            # 生成一个新的事件传递给父类，确保平移立即生效
             dummy_event = QMouseEvent(event.type(), event.position(), event.globalPosition(), 
                                       event.button(), event.buttons(), event.modifiers())
             super().mousePressEvent(dummy_event)
             
         elif event.button() == Qt.MouseButton.LeftButton:
-            # 左键：判断是点到了物体还是空白处
-            
-            # 获取点击位置下的所有物体
             scene_pos = self.mapToScene(event.pos())
             items = self.scene.items(scene_pos)
-            
             clicked_on_item = False
             for item in items:
-                # 如果点击了可视物体或缩放手柄 (排除背景板)
                 if isinstance(item, (VisualMobjectItem, ResizeHandle)):
                     clicked_on_item = True
                     break
-                # 注意：self.black_board 也是一个 Item，但我们需要忽略它
             
-            # 只有当点击的是背景板（即没有点到任何可操作物体）时，才开启框选
             if clicked_on_item:
                 self.setDragMode(QGraphicsView.DragMode.NoDrag)
             else:
@@ -1000,9 +1435,14 @@ class ManimCanvas(QGraphicsView):
 
     def add_visual_item(self, mobject: MobjectData, on_move_cb: Callable[[str], None], change_cb: Optional[Callable[[str], None]] = None) -> None:
         if mobject.id in self.items_map: self.remove_visual_item(mobject.id)
-        item = VisualMobjectItem(mobject, self.pixels_to_units, on_move_cb, change_cb)
+        
+        render_cb = lambda: self.item_render_changed.emit()
+        
+        item = VisualMobjectItem(mobject, self.pixels_to_units, on_move_cb, change_cb, render_finish_callback=render_cb)
         self.scene.addItem(item)
         self.items_map[mobject.id] = item
+        
+        self.item_render_changed.emit()
 
     def update_item_content(self, mob_id: str) -> None:
         if mob_id in self.items_map:
@@ -1014,6 +1454,7 @@ class ManimCanvas(QGraphicsView):
         if mob_id in self.items_map:
             self.scene.removeItem(self.items_map[mob_id])
             del self.items_map[mob_id]
+            self.item_render_changed.emit()
             
     def set_item_visible(self, mob_id: str, visible: bool) -> None:
         if mob_id in self.items_map:
@@ -1030,8 +1471,8 @@ class ManimEditor(QMainWindow):
         self.animations: List[AnimationData] = []
         
         self.is_syncing_selection = False
+        self.current_project_path: Optional[str] = None # 新增：当前项目路径
 
-        # --- Undo/Redo Stacks ---
         self.undo_stack: List[Tuple[List[MobjectData], List[AnimationData]]] = []
         self.redo_stack: List[Tuple[List[MobjectData], List[AnimationData]]] = []
         self.max_history = 50
@@ -1060,6 +1501,26 @@ QWidget#ZoomBar { background-color: #f3f3f3; border-top: 1px solid #e0e0e0; }
         self.init_ui()
 
     def init_ui(self) -> None:
+        # === 新增：文件菜单栏 ===
+        menubar = self.menuBar()
+        file_menu = menubar.addMenu("文件")
+
+        save_action = QAction("保存", self)
+        save_action.setShortcut("Ctrl+S")
+        save_action.triggered.connect(self.save_project)
+        file_menu.addAction(save_action)
+
+        open_action = QAction("打开", self)
+        open_action.setShortcut("Ctrl+O")
+        open_action.triggered.connect(self.open_project)
+        file_menu.addAction(open_action)
+
+        save_as_action = QAction("另存为", self)
+        save_as_action.setShortcut("Ctrl+Shift+S")
+        save_as_action.triggered.connect(self.save_project_as)
+        file_menu.addAction(save_as_action)
+        # =======================
+
         self.act_undo = QAction("撤销 (Ctrl+Z)", self)
         self.act_undo.setShortcut("Ctrl+Z")
         self.act_undo.triggered.connect(self.undo_action)
@@ -1095,13 +1556,16 @@ QWidget#ZoomBar { background-color: #f3f3f3; border-top: 1px solid #e0e0e0; }
 
         main_widget = QWidget()
         self.setCentralWidget(main_widget)
-        main_layout = QHBoxLayout(main_widget)
+        
+        main_root_layout = QHBoxLayout(main_widget)
+        main_root_layout.setContentsMargins(0, 0, 0, 0)
+        main_root_layout.setSpacing(0)
         
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.setHandleWidth(1)
-        main_layout.addWidget(splitter)
         
         left_panel = QWidget()
+        left_panel.setMinimumWidth(300)
         left_layout = QVBoxLayout(left_panel)
         left_layout.setContentsMargins(0,0,0,0)
         left_layout.addWidget(QLabel("对象列表", objectName="PanelHeader"))
@@ -1109,8 +1573,8 @@ QWidget#ZoomBar { background-color: #f3f3f3; border-top: 1px solid #e0e0e0; }
         self.mob_list_widget = QListWidget()
         self.mob_list_widget.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.mob_list_widget.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
-        self.mob_list_widget.itemDoubleClicked.connect(self.edit_mobject_dialog)
         self.mob_list_widget.itemSelectionChanged.connect(self.sync_selection_list_to_canvas)
+        self.mob_list_widget.itemSelectionChanged.connect(self.update_property_panel)
         left_layout.addWidget(self.mob_list_widget)
         splitter.addWidget(left_panel)
         
@@ -1131,6 +1595,8 @@ QWidget#ZoomBar { background-color: #f3f3f3; border-top: 1px solid #e0e0e0; }
         
         self.canvas = ManimCanvas()
         self.canvas.scene.selectionChanged.connect(self.sync_selection_canvas_to_list)
+        self.canvas.scene.selectionChanged.connect(self.update_property_panel)
+        
         cc_layout.addWidget(self.canvas)
         
         self.zoom_bar = QWidget()
@@ -1203,6 +1669,8 @@ QWidget#ZoomBar { background-color: #f3f3f3; border-top: 1px solid #e0e0e0; }
         self.btn_render_big = QPushButton(" 开始渲染")
         self.btn_render_big.setObjectName("RenderBtn")
         self.btn_render_big.setIcon(qta.icon('fa5s.play', color='white'))
+        self.btn_render_big.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_render_big.setToolTip("开始渲染视频")
         self.btn_render_big.clicked.connect(self.render_video)
         
         sb_layout.addWidget(QLabel("文件:"))
@@ -1217,19 +1685,129 @@ QWidget#ZoomBar { background-color: #f3f3f3; border-top: 1px solid #e0e0e0; }
         center_layout.addWidget(settings_bar)
         splitter.addWidget(center_panel)
         
-        right_panel = QWidget()
-        right_layout = QVBoxLayout(right_panel)
-        right_layout.setContentsMargins(0,0,0,0)
-        right_layout.addWidget(QLabel("动画序列", objectName="PanelHeader"))
+        self.right_stack = QStackedWidget()
+        self.right_stack.setMinimumWidth(300)
         
+        self.anim_container = QWidget()
+        anim_layout = QVBoxLayout(self.anim_container)
+        anim_layout.setContentsMargins(0,0,0,0)
+        anim_layout.addWidget(QLabel("动画序列", objectName="PanelHeader"))
         self.anim_list_widget = QListWidget()
         self.anim_list_widget.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
         self.anim_list_widget.itemDoubleClicked.connect(self.edit_animation_dialog)
-        right_layout.addWidget(self.anim_list_widget)
-        splitter.addWidget(right_panel)
+        anim_layout.addWidget(self.anim_list_widget)
         
-        splitter.setSizes([250, 700, 250]) 
+        self.prop_panel = ObjectPropertyPanel()
+        self.prop_panel.property_changed.connect(self.handle_property_panel_change)
+
+        self.right_stack.addWidget(self.anim_container)
+        self.right_stack.addWidget(self.prop_panel)
+        
+        splitter.addWidget(self.right_stack)
+        splitter.setSizes([240, 960, 240])
+        
+        main_root_layout.addWidget(splitter)
+
+        splitter.setCollapsible(0, False)
+        splitter.setCollapsible(1, False)
+        splitter.setCollapsible(2, False)
+
+        self.right_sidebar = RightSideBar()
+        self.right_sidebar.mode_changed.connect(self.right_stack.setCurrentIndex)
+        main_root_layout.addWidget(self.right_sidebar)
+        
+        self.right_stack.setCurrentIndex(0)
+        
         self.update_undo_redo_actions()
+
+    # === 新增：文件保存与打开逻辑 ===
+    def save_project(self):
+        if not self.current_project_path:
+            self.save_project_as()
+        else:
+            self._write_to_file(self.current_project_path)
+
+    def save_project_as(self):
+        file_path, _ = QFileDialog.getSaveFileName(self, "另存为", "", "Manim Project (*.manim)")
+        if file_path:
+            if not file_path.endswith('.manim'):
+                file_path += '.manim'
+            self.current_project_path = file_path
+            self._write_to_file(file_path)
+
+    def _write_to_file(self, path):
+        try:
+            data = {
+                "mobjects": [asdict(m) for m in self.mobjects],
+                "animations": [asdict(a) for a in self.animations]
+            }
+            with open(path, 'w', encoding='utf-8') as f:
+                json.dump(data, f, indent=4, ensure_ascii=False)
+            self.console_output.append(f"项目已保存: {path}")
+        except Exception as e:
+            QMessageBox.critical(self, "保存失败", str(e))
+
+    def load_project_from_file(self, file_path):
+        """核心加载逻辑，供 open_project 和双击启动时调用"""
+        if not os.path.exists(file_path): return
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                data: dict = json.load(f)
+            
+            # 重建对象
+            new_mobs = [MobjectData(**d) for d in data.get("mobjects", [])]
+            new_anims = [AnimationData(**d) for d in data.get("animations", [])]
+            
+            # 清空历史并恢复状态
+            self.undo_stack.clear()
+            self.redo_stack.clear()
+            self.update_undo_redo_actions()
+            
+            self.current_project_path = file_path
+            self.restore_state((new_mobs, new_anims))
+            self.console_output.append(f"已加载项目: {file_path}")
+            
+        except Exception as e:
+            QMessageBox.critical(self, "加载失败", f"文件格式错误或损坏: {str(e)}")
+
+    def open_project(self):
+        """点击菜单'打开'时调用"""
+        file_path, _ = QFileDialog.getOpenFileName(self, "打开项目", "", "Manim Project (*.manim)")
+        if file_path:
+            self.load_project_from_file(file_path)
+    # ==============================
+
+    def update_property_panel(self):
+        selected_items = self.mob_list_widget.selectedItems()
+        if len(selected_items) == 1:
+            mob_id = selected_items[0].data(Qt.ItemDataRole.UserRole)
+            mob = next((m for m in self.mobjects if m.id == mob_id), None)
+            self.prop_panel.set_mobject(mob)
+        else:
+            self.prop_panel.set_mobject(None)
+
+    def handle_property_panel_change(self, field: str, value: Any, save_history: bool):
+        selected_items = self.mob_list_widget.selectedItems()
+        if not selected_items: return
+        mob_id = selected_items[0].data(Qt.ItemDataRole.UserRole)
+        mob = next((m for m in self.mobjects if m.id == mob_id), None)
+        if not mob: return
+
+        if save_history:
+            self.save_to_history()
+
+        if field == "name":
+            mob.name = value
+            self.refresh_ui() 
+        elif field == "color":
+            mob.color = value
+            self.canvas.update_item_content(mob.id)
+        elif field == "content":
+            mob.content = value
+            self.canvas.update_item_content(mob.id)
+        elif field == "font":
+            mob.font = value
+            self.canvas.update_item_content(mob.id)
 
     def on_zoom_slider_change(self, value: int) -> None:
         self.zoom_label.setText(f"{value}%")
@@ -1276,14 +1854,10 @@ QWidget#ZoomBar { background-color: #f3f3f3; border-top: 1px solid #e0e0e0; }
                 item.setSelected(True)
         self.is_syncing_selection = False
 
-    # --- 历史记录管理核心方法 ---
-
     def capture_state(self) -> Tuple[List[MobjectData], List[AnimationData]]:
-        """返回当前状态的深拷贝"""
         return (copy.deepcopy(self.mobjects), copy.deepcopy(self.animations))
 
     def save_to_history(self) -> None:
-        """在执行修改前调用，保存当前状态到 undo 栈，并清空 redo 栈"""
         state = self.capture_state()
         self.undo_stack.append(state)
         if len(self.undo_stack) > self.max_history:
@@ -1297,36 +1871,29 @@ QWidget#ZoomBar { background-color: #f3f3f3; border-top: 1px solid #e0e0e0; }
 
     def undo_action(self) -> None:
         if not self.undo_stack: return
-        # 1. 保存当前状态到 redo
         current_state = self.capture_state()
         self.redo_stack.append(current_state)
-        # 2. 弹出 undo 栈顶
         prev_state = self.undo_stack.pop()
-        # 3. 恢复
         self.restore_state(prev_state)
         self.update_undo_redo_actions()
 
     def redo_action(self) -> None:
         if not self.redo_stack: return
-        # 1. 保存当前状态到 undo
         current_state = self.capture_state()
         self.undo_stack.append(current_state)
-        # 2. 弹出 redo 栈顶
         next_state = self.redo_stack.pop()
-        # 3. 恢复
         self.restore_state(next_state)
         self.update_undo_redo_actions()
 
     def restore_state(self, state: Tuple[List[MobjectData], List[AnimationData]]) -> None:
-        """从状态元组中恢复数据，并刷新所有视图"""
         mobs_snapshot, anims_snapshot = state
         self.mobjects = mobs_snapshot
         self.animations = anims_snapshot
         self.refresh_ui() 
         self.sync_canvas_visuals()
+        self.update_property_panel()
 
     def sync_canvas_visuals(self) -> None:
-        """根据 self.mobjects 列表强制同步画布上的图形"""
         current_ids = set()
         for mob in self.mobjects:
             current_ids.add(mob.id)
@@ -1349,7 +1916,6 @@ QWidget#ZoomBar { background-color: #f3f3f3; border-top: 1px solid #e0e0e0; }
             self.canvas.remove_visual_item(mid)
 
     def handle_item_manipulation(self, state_type: str) -> None:
-        """VisualMobjectItem 移动/缩放时的回调"""
         if state_type == "start":
             self.temp_state_snapshot = self.capture_state()
         elif state_type == "end":
@@ -1399,18 +1965,7 @@ QWidget#ZoomBar { background-color: #f3f3f3; border-top: 1px solid #e0e0e0; }
             self.refresh_ui()
 
     def edit_mobject_dialog(self, item: QListWidgetItem) -> None:
-        mob: MobjectData = next((m for m in self.mobjects if m.id == item.data(Qt.ItemDataRole.UserRole)), None)
-        if not mob: return
-        dlg = MobjectEditDialog(self, mobject=mob)
-        if dlg.exec():
-            self.save_to_history()
-            data = dlg.get_data()
-            mob.name = data["name"]
-            mob.color = data["color"]
-            mob.content = data["content"]
-            mob.font = data["font"]
-            self.canvas.update_item_content(mob.id)
-            self.refresh_ui()
+        pass
 
     def add_animation_dialog(self) -> None:
         if not self.mobjects: 
@@ -1548,6 +2103,8 @@ QWidget#ZoomBar { background-color: #f3f3f3; border-top: 1px solid #e0e0e0; }
             btn_del.clicked.connect(lambda checked, aid=anim.id: self.delete_animation(aid))
             l.addWidget(btn_del)
             self.anim_list_widget.setItemWidget(item, w)
+        
+        self.update_property_panel()
 
     def generate_script(self) -> str:
         scene_name = self.input_scene_name.text().strip()
@@ -1594,6 +2151,21 @@ QWidget#ZoomBar { background-color: #f3f3f3; border-top: 1px solid #e0e0e0; }
         return script
 
     def render_video(self) -> None:
+        error_objects = []
+        for mob_id, item in self.canvas.items_map.items():
+            if item.has_render_error:
+                error_objects.append(item.mob_data.name)
+        
+        if error_objects:
+            msg = "以下对象存在 LaTeX 语法错误，无法进行渲染：\n\n" + "\n".join(f"- {name}" for name in error_objects)
+            msg += "\n\n请修改公式内容后再试。"
+            QMessageBox.warning(self, "渲染无法开始", msg)
+            return
+
+        if not self.animations:
+            QMessageBox.warning(self, "渲染无法开始", "当前没有添加任何动画。\n请在右侧侧边栏添加动画后再进行渲染。")
+            return
+
         self.render_progress_bar.setVisible(True)
         self.render_progress_bar.setRange(0, 0)
         self.set_ui_locked(True)
@@ -1626,8 +2198,6 @@ QWidget#ZoomBar { background-color: #f3f3f3; border-top: 1px solid #e0e0e0; }
         self.process.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
         self.process.readyReadStandardOutput.connect(self.handle_output)
         self.process.finished.connect(self.render_finished)
-
-        self.console_output.append(f"Manim> {command}\n")
         self.process.start(sys.executable, command.split(" "))
 
     def handle_output(self) -> None:
@@ -1640,9 +2210,50 @@ QWidget#ZoomBar { background-color: #f3f3f3; border-top: 1px solid #e0e0e0; }
         self.set_ui_locked(False)
         self.render_progress_bar.setVisible(False)
 
+def register_user_association(ext, type_name, icon_path):
+    """辅助函数：为当前用户设置文件关联"""
+    try:
+        python_exe = sys.executable.replace("python.exe", "pythonw.exe")
+        script_path = os.path.abspath(__file__)
+        command = f'"{python_exe}" "{script_path}" "%1"'
+        base_key = r"Software\Classes"
+
+        # 1. 关联扩展名
+        with reg.CreateKey(reg.HKEY_CURRENT_USER, f"{base_key}\\{ext}") as key:
+            reg.SetValue(key, "", reg.REG_SZ, type_name)
+
+        # 2. 注册类型和图标
+        with reg.CreateKey(reg.HKEY_CURRENT_USER, f"{base_key}\\{type_name}") as key:
+            reg.SetValue(key, "", reg.REG_SZ, "Manim Editor Project")
+        
+        if icon_path and os.path.exists(icon_path):
+            with reg.CreateKey(reg.HKEY_CURRENT_USER, f"{base_key}\\{type_name}\\DefaultIcon") as key:
+                reg.SetValue(key, "", reg.REG_SZ, icon_path)
+
+        # 3. 设置打开命令
+        with reg.CreateKey(reg.HKEY_CURRENT_USER, f"{base_key}\\{type_name}\\shell\\open\\command") as key:
+            reg.SetValue(key, "", reg.REG_SZ, command)
+
+        # 4. 刷新缓存
+        ctypes.windll.shell32.SHChangeNotify(0x08000000, 0x0000, None, None)
+    except Exception:
+        pass # 出错也不要影响程序启动
+
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
+    
+    # 尝试设置文件关联（每次启动都检查一下，确保关联存在）
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    register_user_association(".manim", "Manim.Project", findfile("file.ico"))
+
     window = ManimEditor()
     window.showMaximized()
+
+    # 检查是否有启动参数（双击文件会传入文件路径）
+    if len(sys.argv) > 1:
+        file_to_open = sys.argv[1]
+        if file_to_open.endswith(".manim"):
+            window.load_project_from_file(file_to_open)
+
     sys.exit(app.exec())
