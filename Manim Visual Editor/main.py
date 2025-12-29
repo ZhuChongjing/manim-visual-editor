@@ -146,16 +146,22 @@ MANIM_COLORS_DICT = {
 }
 
 MANIM_COLORS_LIST = list(MANIM_COLORS_DICT.keys())
-
 CANVAS_WIDTH: int = 960
 CANVAS_HEIGHT: int = 540
 BASE_TEXT_SIZE: int = 32
 MANIM_UNIT_PER_PIXEL: Decimal = Decimal(str(MathTex("x").height)) / Decimal(str(QSvgRenderer(str(tex_to_svg_file("$x$", tex_template=TexTemplate()))).viewBoxF().height()))
 SNAP_THRESHOLD_PIXELS: float = 10.0
 AVAILABLE_FONTS: List[str] = Text.font_list()
+CURRENT_DIR: str = os.path.dirname(os.path.abspath(__file__))
+
+# 设置
+FILE_EXTENSION = ".manim"
+FILE_DESCRIPTION = "Manim Project File"
+EDITOR_ICON = "icon.ico"
+FILE_ICON = "file.ico"
 
 # === 辅助函数 ===
-def findfile(file_name: str, search_dir: str = ".") -> Optional[str]:
+def findfile(file_name: str, search_dir: str = CURRENT_DIR) -> Optional[str]:
     for root, dirs, files in os.walk(search_dir):
         if file_name in files:
             return os.path.abspath(os.path.join(root, file_name))
@@ -1461,17 +1467,19 @@ class ManimCanvas(QGraphicsView):
             self.items_map[mob_id].setVisible(visible)
 
 # === 主窗口 ===
-
 class ManimEditor(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("Manim Visual Editor")
-        self.setWindowIcon(QIcon(findfile("icon.png")))
+        
+        # 设置图标逻辑 (自动寻找目录下的图标)
+        self.setWindowIcon(QIcon(findfile(EDITOR_ICON)))
+
         self.mobjects: List[MobjectData] = []
         self.animations: List[AnimationData] = []
         
         self.is_syncing_selection = False
-        self.current_project_path: Optional[str] = None # 新增：当前项目路径
+        self.current_project_path: Optional[str] = None 
 
         self.undo_stack: List[Tuple[List[MobjectData], List[AnimationData]]] = []
         self.redo_stack: List[Tuple[List[MobjectData], List[AnimationData]]] = []
@@ -1501,7 +1509,7 @@ QWidget#ZoomBar { background-color: #f3f3f3; border-top: 1px solid #e0e0e0; }
         self.init_ui()
 
     def init_ui(self) -> None:
-        # === 新增：文件菜单栏 ===
+        # === 菜单栏 ===
         menubar = self.menuBar()
         file_menu = menubar.addMenu("文件")
 
@@ -1720,7 +1728,6 @@ QWidget#ZoomBar { background-color: #f3f3f3; border-top: 1px solid #e0e0e0; }
         
         self.update_undo_redo_actions()
 
-    # === 新增：文件保存与打开逻辑 ===
     def save_project(self):
         if not self.current_project_path:
             self.save_project_as()
@@ -1728,10 +1735,10 @@ QWidget#ZoomBar { background-color: #f3f3f3; border-top: 1px solid #e0e0e0; }
             self._write_to_file(self.current_project_path)
 
     def save_project_as(self):
-        file_path, _ = QFileDialog.getSaveFileName(self, "另存为", "", "Manim Project (*.manim)")
+        file_path, _ = QFileDialog.getSaveFileName(self, "另存为", "", f"{FILE_DESCRIPTION} (*{FILE_EXTENSION})")
         if file_path:
-            if not file_path.endswith('.manim'):
-                file_path += '.manim'
+            if not file_path.endswith(FILE_EXTENSION):
+                file_path += FILE_EXTENSION
             self.current_project_path = file_path
             self._write_to_file(file_path)
 
@@ -1744,21 +1751,19 @@ QWidget#ZoomBar { background-color: #f3f3f3; border-top: 1px solid #e0e0e0; }
             with open(path, 'w', encoding='utf-8') as f:
                 json.dump(data, f, indent=4, ensure_ascii=False)
             self.console_output.append(f"项目已保存: {path}")
+            QMessageBox.information(self, "成功", "项目已保存！")
         except Exception as e:
             QMessageBox.critical(self, "保存失败", str(e))
 
     def load_project_from_file(self, file_path):
-        """核心加载逻辑，供 open_project 和双击启动时调用"""
         if not os.path.exists(file_path): return
         try:
             with open(file_path, 'r', encoding='utf-8') as f:
                 data: dict = json.load(f)
             
-            # 重建对象
             new_mobs = [MobjectData(**d) for d in data.get("mobjects", [])]
             new_anims = [AnimationData(**d) for d in data.get("animations", [])]
             
-            # 清空历史并恢复状态
             self.undo_stack.clear()
             self.redo_stack.clear()
             self.update_undo_redo_actions()
@@ -1771,11 +1776,9 @@ QWidget#ZoomBar { background-color: #f3f3f3; border-top: 1px solid #e0e0e0; }
             QMessageBox.critical(self, "加载失败", f"文件格式错误或损坏: {str(e)}")
 
     def open_project(self):
-        """点击菜单'打开'时调用"""
-        file_path, _ = QFileDialog.getOpenFileName(self, "打开项目", "", "Manim Project (*.manim)")
+        file_path, _ = QFileDialog.getOpenFileName(self, "打开项目", "", f"{FILE_DESCRIPTION} (*{FILE_EXTENSION})")
         if file_path:
             self.load_project_from_file(file_path)
-    # ==============================
 
     def update_property_panel(self):
         selected_items = self.mob_list_widget.selectedItems()
@@ -1901,12 +1904,15 @@ QWidget#ZoomBar { background-color: #f3f3f3; border-top: 1px solid #e0e0e0; }
                 item: VisualMobjectItem = self.canvas.items_map[mob.id]
                 item.mob_data = mob 
                 item.setScale(mob.scale)
+                item.setVisible(mob.visible) 
                 item.update_position_from_data()
                 item.update_content()
                 item.update_tooltip()
                 item.update()
             else:
                 self.canvas.add_visual_item(mob, self.refresh_ui_dummy, self.handle_item_manipulation)
+                if mob.id in self.canvas.items_map:
+                    self.canvas.items_map[mob.id].setVisible(mob.visible)
 
         ids_to_remove = []
         for mid in self.canvas.items_map.keys():
@@ -2030,6 +2036,13 @@ QWidget#ZoomBar { background-color: #f3f3f3; border-top: 1px solid #e0e0e0; }
 
     def refresh_ui_dummy(self, mid: str) -> None: pass 
 
+    def toggle_mobject_visibility(self, mob_id: str):
+        mob = next((m for m in self.mobjects if m.id == mob_id), None)
+        if mob:
+            mob.visible = not mob.visible
+            self.canvas.set_item_visible(mob.id, mob.visible)
+            self.refresh_ui()
+
     def refresh_ui(self) -> None:
         self.mob_list_widget.blockSignals(True)
         self.mob_list_widget.clear()
@@ -2046,6 +2059,14 @@ QWidget#ZoomBar { background-color: #f3f3f3; border-top: 1px solid #e0e0e0; }
             w = QWidget()
             l = QHBoxLayout(w)
             l.setContentsMargins(5,2,5,2)
+            
+            btn_vis = QToolButton()
+            icon_name = 'fa5s.eye' if mob.visible else 'fa5s.eye-slash'
+            btn_vis.setIcon(qta.icon(icon_name, color='#555'))
+            btn_vis.setAutoRaise(True)
+            btn_vis.clicked.connect(lambda checked, mid=mob.id: self.toggle_mobject_visibility(mid))
+            l.addWidget(btn_vis)
+
             l.addWidget(QLabel(mob.name, styleSheet="font-weight:bold;"))
             l.addStretch()
             l.addWidget(QLabel(mob.mob_type, styleSheet="color:#888; font-size:9pt; margin-right:5px;"))
@@ -2198,6 +2219,8 @@ QWidget#ZoomBar { background-color: #f3f3f3; border-top: 1px solid #e0e0e0; }
         self.process.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
         self.process.readyReadStandardOutput.connect(self.handle_output)
         self.process.finished.connect(self.render_finished)
+
+        self.console_output.append(f"Manim> {command}\n")
         self.process.start(sys.executable, command.split(" "))
 
     def handle_output(self) -> None:
@@ -2224,7 +2247,7 @@ def register_user_association(ext, type_name, icon_path):
 
         # 2. 注册类型和图标
         with reg.CreateKey(reg.HKEY_CURRENT_USER, f"{base_key}\\{type_name}") as key:
-            reg.SetValue(key, "", reg.REG_SZ, "Manim Editor Project")
+            reg.SetValue(key, "", reg.REG_SZ, FILE_DESCRIPTION)
         
         if icon_path and os.path.exists(icon_path):
             with reg.CreateKey(reg.HKEY_CURRENT_USER, f"{base_key}\\{type_name}\\DefaultIcon") as key:
@@ -2244,8 +2267,7 @@ if __name__ == "__main__":
     app.setStyle("Fusion")
     
     # 尝试设置文件关联（每次启动都检查一下，确保关联存在）
-    current_dir = os.path.dirname(os.path.abspath(__file__))
-    register_user_association(".manim", "Manim.Project", findfile("file.ico"))
+    register_user_association(FILE_EXTENSION, "Manim.Project", findfile(FILE_ICON))
 
     window = ManimEditor()
     window.showMaximized()
@@ -2253,7 +2275,7 @@ if __name__ == "__main__":
     # 检查是否有启动参数（双击文件会传入文件路径）
     if len(sys.argv) > 1:
         file_to_open = sys.argv[1]
-        if file_to_open.endswith(".manim"):
+        if file_to_open.endswith(FILE_EXTENSION):
             window.load_project_from_file(file_to_open)
 
     sys.exit(app.exec())
